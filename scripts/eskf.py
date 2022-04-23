@@ -97,7 +97,9 @@ class ESKF:
         measured_accel = imu_data.linear_acceleration
         measured_ang_vel = imu_data.angular_velocity
 
-        T = time.time - self.last_disc_time
+        # TODO: transfer imu data to numpy arrays
+
+        T = time.time - self.last_time
 
         A, G = self.discretize(measured_accel, measured_ang_vel, T)
 
@@ -110,6 +112,9 @@ class ESKF:
 
     def correct(self, dvl_data):
         velocity = dvl_data.linear
+        # TODO: transfer dvl data to numpy arrays
+
+
         z = self.H @ velocity       
 
         # EKF update
@@ -200,7 +205,7 @@ if __name__ == "__main__":
 
 
     try:
-        eskf = ESKF()
+        eskf = ESKF(p=0.001, p_ba=0.001, p_bv=0.001, n=0.001, r=0.001)
         rospy.spin()
 
     except rospy.ROSInterruptException:
