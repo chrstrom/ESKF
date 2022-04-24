@@ -10,7 +10,6 @@ from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Twist
 
 
-
 # TODO: Move all tuning parameters to config file, and load in ESKF_ROS()
 # TODO: Coordinate frame transformation for IMU and DVL
 # TODO: Define input and output frames
@@ -18,9 +17,8 @@ from geometry_msgs.msg import Twist
 # TODO: Make own basic quaternion lib
 # TODO: Make ESKF class hold less state and pass more params
 
-class ESKF_ROS():
 
-
+class ESKF_ROS:
     def __init__(self):
         rospy.init_node("eskf")
 
@@ -51,9 +49,7 @@ class ESKF_ROS():
         self.eskf.correct(measured_velocity)
 
 
-
 class ESKF:
-
     def __init__(self, p, p_ba, p_bv, n, r):
         """
         p: initial covariances for P
@@ -69,8 +65,12 @@ class ESKF:
         self.N_meas_terms = 3
 
         # Initial states and covariances
-        self.nom_state = np.zeros((self.N_nom_state , 1)) #[pos, vel, orientation (quat), bias_accel, bias_ang_vel]
-        self.err_state = np.zeros((self.N_err_state, 1)) #[pos, vel, orientation (eulr), bias_accel, bias_ang_vel] (errors)
+        self.nom_state = np.zeros(
+            (self.N_nom_state, 1)
+        )  # [pos, vel, orientation (quat), bias_accel, bias_ang_vel]
+        self.err_state = np.zeros(
+            (self.N_err_state, 1)
+        )  # [pos, vel, orientation (eulr), bias_accel, bias_ang_vel] (errors)
 
         self.error_state_covariance = p * np.eye(self.N_err_state)
 
@@ -86,15 +86,17 @@ class ESKF:
         self.is_init = False
         self.last_time = time.time()
 
-
-
     def n(self):
         # Sample 12-dim zero mean process noise vector
-        return np.random.multivariate_normal(np.zeros(self.N_noise_terms), self.process_noise_covariance).reshape((self.N_noise_terms, 1))
+        return np.random.multivariate_normal(
+            np.zeros(self.N_noise_terms), self.process_noise_covariance
+        ).reshape((self.N_noise_terms, 1))
 
     def w(self):
         # Sample 3-dim zero mean measurement noise vector
-        return np.random.multivariate_normal(np.zeros(self.N_meas_terms), self.measurement_noise_covariance).reshape((self.N_meas_terms, 1))
+        return np.random.multivariate_normal(
+            np.zeros(self.N_meas_terms), self.measurement_noise_covariance
+        ).reshape((self.N_meas_terms, 1))
 
     def Hx(self):
         """
@@ -103,8 +105,6 @@ class ESKF:
         H = np.zeros((3, self.N_nom_state))
         H[:3, 3:6] = np.eye(3)
         return H
-
-
 
     def predict_measurement(self):
         z_pred = self.Hx() @ self.nom_state + self.w()
@@ -124,16 +124,15 @@ class ESKF:
         eta_a = qa[:1].ravel()
         eps_a = qa[1:].ravel()
 
-        qb = np.r_[np.array([1]).reshape(1, 1), 0.5*self.err_state[6:9, :]]
+        qb = np.r_[np.array([1]).reshape(1, 1), 0.5 * self.err_state[6:9, :]]
         QA = np.zeros((4, 4))
         QA[:3, 0] = eps_a
         QA[0, 1:4] = -eps_a.T
         QA[1:4, 1:4] = self.S(eps_a)
 
-        x[6:10] = (eta_a * np.eye(4) + QA ) @ qb
+        x[6:10] = (eta_a * np.eye(4) + QA) @ qb
 
         return x
-
 
     def update(self, measured_accel, measured_ang_vel):
 
@@ -147,18 +146,17 @@ class ESKF:
 
         err_state_dot = A @ self.err_state + G @ self.n()
 
-        self.err_state +=  T * err_state_dot # simple euler integration
+        self.err_state += T * err_state_dot  # simple euler integration
         self.last_time = time.time()
 
         rospy.loginfo(self.err_state)
 
-
     def correct(self, measured_vel):
         # EKF update
         H = self.measurement_jacobian()
-        P = self.error_state_covariance 
+        P = self.error_state_covariance
 
-        W = P @ H.T @ la.inv(H@P@H.T + self.measurement_noise_covariance)
+        W = P @ H.T @ la.inv(H @ P @ H.T + self.measurement_noise_covariance)
         self.err_state = W @ (measured_vel - self.predict_measurement())
         P = (np.eye(self.N_err_state) - W @ H) @ P
         self.nom_state = self.compose_state()
@@ -171,8 +169,6 @@ class ESKF:
         # Reset error state
         self.err_state = np.zeros((self.N_err_state, 1))
 
-
-
     def measurement_jacobian(self):
         # "H" in the literature
 
@@ -180,9 +176,9 @@ class ESKF:
         eta = q[:1]
         eps = q[1:]
 
-        Q_dtheta = 0.5 * np.r_[-eps.reshape((1, 3)), eta*np.eye(3) + self.S(eps)]
+        Q_dtheta = 0.5 * np.r_[-eps.reshape((1, 3)), eta * np.eye(3) + self.S(eps)]
         X_dx = la.block_diag(np.eye(6), Q_dtheta, np.eye(6))
-        
+
         H = self.Hx() @ X_dx
 
         return H.astype(np.float64)
@@ -191,11 +187,13 @@ class ESKF:
         eta = q[:1]
         eps = q[1:]
         S = self.S(eps)
-        R = np.eye(3) + 2*eta*S + 2*S@S
+        R = np.eye(3) + 2 * eta * S + 2 * S @ S
         return R
 
     def S(self, v):
-        S = np.array([0, -v[2], v[1], v[2], 0, -v[0], -v[1], v[0], 0], dtype=object).reshape((3, 3))
+        S = np.array(
+            [0, -v[2], v[1], v[2], 0, -v[0], -v[1], v[0], 0], dtype=object
+        ).reshape((3, 3))
 
         return S
 
@@ -236,10 +234,9 @@ class ESKF:
         AD = la.expm(T * AC)
         GD = T * GC
         return AD, GD
-        
+
 
 if __name__ == "__main__":
-
 
     try:
         eskf = ESKF_ROS()
@@ -247,4 +244,3 @@ if __name__ == "__main__":
 
     except rospy.ROSInterruptException:
         pass
-    
