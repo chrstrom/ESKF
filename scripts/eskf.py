@@ -9,10 +9,47 @@ import rospy
 from sensor_msgs.msg import Imu
 from geometry_msgs.msg import Twist
 
-# For every IMU measurement:
-#     propagate state
-# For every DVL measurement:
-#     correct state
+
+
+# TODO: Move all tuning parameters to config file, and load in ESKF_ROS()
+# TODO: Coordinate frame transformation for IMU and DVL
+# TODO: Define input and output frames
+# TODO: Change la.expm to Van Loan
+# TODO: Make own basic quaternion lib
+# TODO: Make ESKF class hold less state and pass more params
+
+class ESKF_ROS():
+
+
+    def __init__(self):
+        rospy.init_node("eskf")
+
+        # p = rospy.get_param("/p")
+        # p_ba = rospy.get_param("/p_ba")
+        # p_bv = rospy.get_param("/p_bv")
+        # n = rospy.get_param("/n")
+        # r = rospy.get_param("/r")
+
+        self.eskf = ESKF(p=1e-8, p_ba=1e-8, p_bv=1e-6, n=0.001, r=0.001)
+
+        rospy.Subscriber("/imu/data_raw", Imu, self.update, queue_size=100)
+        rospy.Subscriber("/dvl/data_raw", Twist, self.correct, queue_size=3)
+
+    def update(self, imu_msg):
+        a = imu_msg.linear_acceleration
+        v = imu_msg.angular_velocity
+
+        measured_accel = np.array([a.x, a.y, a.z])
+        measured_ang_vel = np.array([v.x, v.y, v.z])
+
+        self.eskf.update(measured_accel, measured_ang_vel)
+
+    def correct(self, dvl_msg):
+        v = dvl_msg.linear
+        measured_velocity = np.array([v.x, v.y, v.z]).reshape((3, 1))
+
+        self.eskf.correct(measured_velocity)
+
 
 
 class ESKF:
@@ -26,9 +63,6 @@ class ESKF:
         r = measurement noise covariance
 
         """
-
-        rospy.init_node("eskf")
-        
         self.N_nom_state = 16
         self.N_err_state = 15
         self.N_noise_terms = 12
@@ -48,11 +82,8 @@ class ESKF:
         self.process_noise_covariance = n * np.eye(self.N_noise_terms)
         self.measurement_noise_covariance = r * np.eye(self.N_meas_terms)
 
-        rospy.Subscriber("/imu/data_raw", Imu, self.update, queue_size=100)
-        rospy.Subscriber("/dvl/data_raw", Twist, self.correct, queue_size=3)
-
         # Avoid dt in propagate growing too high
-        self.first_imu_msg = True
+        self.is_init = False
         self.last_time = time.time()
 
 
@@ -104,17 +135,11 @@ class ESKF:
         return x
 
 
-    def update(self, imu_data):
+    def update(self, measured_accel, measured_ang_vel):
 
-        if self.first_imu_msg:
+        if not self.is_init:
             self.last_time = time.time()
-            self.first_imu_msg = False
-
-        a = imu_data.linear_acceleration
-        v = imu_data.angular_velocity
-
-        measured_accel = np.array([a.x, a.y, a.z])
-        measured_ang_vel = np.array([v.x, v.y, v.z])
+            self.is_init = True
 
         T = time.time() - self.last_time
 
@@ -128,10 +153,7 @@ class ESKF:
         rospy.loginfo(self.err_state)
 
 
-    def correct(self, dvl_data):
-        v = dvl_data.linear
-        measured_vel = np.array([v.x, v.y, v.z]).reshape((3, 1))
-
+    def correct(self, measured_vel):
         # EKF update
         H = self.measurement_jacobian()
         P = self.error_state_covariance 
@@ -220,7 +242,7 @@ if __name__ == "__main__":
 
 
     try:
-        eskf = ESKF(p=1e-8, p_ba=1e-8, p_bv=1e-6, n=0.001, r=0.001)
+        eskf = ESKF_ROS()
         rospy.spin()
 
     except rospy.ROSInterruptException:
