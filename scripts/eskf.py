@@ -107,7 +107,7 @@ class ESKF:
         return H
 
     def predict_measurement(self):
-        z_pred = self.Hx() @ self.nom_state + self.w()
+        z_pred = self.Hx() @ self.nom_state
         return z_pred
 
     def compose_state(self):
@@ -144,7 +144,7 @@ class ESKF:
 
         A, G = self.discretize(measured_accel, measured_ang_vel, T)
 
-        err_state_dot = A @ self.err_state + G @ self.n()
+        err_state_dot = A @ self.err_state
 
         self.err_state += T * err_state_dot  # simple euler integration
         self.last_time = time.time()
