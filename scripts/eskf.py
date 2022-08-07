@@ -1,246 +1,390 @@
-#!/usr/bin/env python3
-
 import numpy as np
-import scipy.linalg as la
-import time
+from numpy import ndarray
+import scipy
+from dataclasses import dataclass, field
+from typing import Tuple
+from functools import cache
 
-import rospy
+from types.multivariate_gaussian import MultiVariateGaussian
+from types.measurements import ImuMeasurement
+from datatypes.eskf_states import NominalState, ErrorStateGauss
+from utils.indexing import block_3x3
 
-from sensor_msgs.msg import Imu
-from geometry_msgs.msg import Twist
-
-
-# TODO: Move all tuning parameters to config file, and load in ESKF_ROS()
-# TODO: Coordinate frame transformation for IMU and DVL
-# TODO: Define input and output frames
-# TODO: Change la.expm to Van Loan
-# TODO: Make own basic quaternion lib
-# TODO: Make ESKF class hold less state and pass more params
+from quaternion import RotationQuaterion
+from cross_matrix import get_cross_matrix
 
 
-class ESKF_ROS:
-    def __init__(self):
-        rospy.init_node("eskf")
+from numpy import ndarray
+from dataclasses import dataclass
+from typing import Optional, TYPE_CHECKING
 
-        # p = rospy.get_param("/p")
-        # p_ba = rospy.get_param("/p_ba")
-        # p_bv = rospy.get_param("/p_bv")
-        # n = rospy.get_param("/n")
-        # r = rospy.get_param("/r")
+if TYPE_CHECKING:  # used to avoid circular imports with solution
+    from quaternion import RotationQuaterion
 
-        self.eskf = ESKF(p=1e-8, p_ba=1e-8, p_bv=1e-6, n=0.001, r=0.001)
+from datatypes.multivargaussian import MultiVarGaussStamped
 
-        rospy.Subscriber("/imu/data_raw", Imu, self.update, queue_size=100)
-        rospy.Subscriber("/dvl/data_raw", Twist, self.correct, queue_size=3)
-
-    def update(self, imu_msg):
-        a = imu_msg.linear_acceleration
-        v = imu_msg.angular_velocity
-
-        measured_accel = np.array([a.x, a.y, a.z])
-        measured_ang_vel = np.array([v.x, v.y, v.z])
-
-        self.eskf.update(measured_accel, measured_ang_vel)
-
-    def correct(self, dvl_msg):
-        v = dvl_msg.linear
-        measured_velocity = np.array([v.x, v.y, v.z]).reshape((3, 1))
-
-        self.eskf.correct(measured_velocity)
+from config import DEBUG
 
 
-class ESKF:
-    def __init__(self, p, p_ba, p_bv, n, r):
+@dataclass
+class NominalState:
+    """Class representing a nominal state as in Brekke (Table 10.1) 
+    Args:
+        pos (ndarray[3]): position in NED
+        vel (ndarray[3]): velocity in NED
+        ori (RotationQuaterion): orientation as a quaternion in NED
+        accm_bias (ndarray[3]): accelerometer bias
+        gyro_bias (ndarray[3]): gyro bias
+    """
+    pos: 'ndarray[3]'
+    vel: 'ndarray[3]'
+    ori: 'RotationQuaterion'
+    accm_bias: 'ndarray[3]'
+    gyro_bias: 'ndarray[3]'
+
+    ts: Optional[float] = None
+
+@dataclass
+class ErrorStateGauss(MultiVariateGaussian):
+    """A multivariate gaussian representing the error state.
+    Has some properties to fetch out useful indexes"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        assert self.mean.shape == (15,)
+
+    @property
+    def pos(self):
+        """position"""
+        return self.mean[0:3]
+
+    @property
+    def vel(self):
+        """velocity"""
+        return self.mean[3:6]
+
+    @property
+    def avec(self):
+        """angles vector
+        this is often called a rotation vector
         """
-        p: initial covariances for P
-        p_ba = inverse time constant for the accelerometer bias process
-        b_bv = inverse time constant for the gyro bias process
-        n = process noise covariance
-        r = measurement noise covariance
+        return self.mean[6:9]
 
+    @property
+    def accm_bias(self):
+        """accelerometer bias"""
+        return self.mean[9:12]
+
+    @property
+    def gyro_bias(self):
+        """gyro bias"""
+        return self.mean[12:15]
+
+@dataclass
+class ESKF():
+    acc_std: float
+    acc_bias_std: float
+    acc_bias_rate: float # rate = p in Brekke
+
+    gyro_std: float
+    gyro_bias_std: float
+    gyro_bias_rate: float # rate = p in Brekke
+
+    acc_correction: 'ndarray[3,3]'
+    gyro_correction: 'ndarray[3,3]'
+    lever_arm: 'ndarray[3]'
+
+    Q_err: 'ndarray[12,12]' = field(init=False, repr=False)
+    g: 'ndarray[3]' = np.array([0, 0, 9.82])
+
+    def __post_init__(self):
+        # Brekke 10.70
+        V = self.acc_std ** 2 * self.acc_correction @ self.acc_correction.T 
+        T = self.gyro_std ** 2 * self.gyro_correction @ self.gyro_correction.T
+        A = self.acc_bias_std ** 2 * np.eye(3)
+        O = self.gyro_bias_std ** 2 * np.eye(3)
+
+        self.Q_err = scipy.linalg.block_diag(V, T, A, O)
+
+    def A_err_cont(self,
+        x_nom_prev: NominalState,
+        u_imu_body: ImuMeasurement,
+        ) -> 'ndarray[15,15]':
+        """Get the transition matrix, A, in Brekke (10.68)
+
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+            z_corr (ImuMeasurement): corrected IMU measurement
+        Returns:
+            A (ndarray[15,15]): A
         """
-        self.N_nom_state = 16
-        self.N_err_state = 15
-        self.N_noise_terms = 12
-        self.N_meas_terms = 3
-
-        # Initial states and covariances
-        self.nom_state = np.zeros(
-            (self.N_nom_state, 1)
-        )  # [pos, vel, orientation (quat), bias_accel, bias_ang_vel]
-        self.err_state = np.zeros(
-            (self.N_err_state, 1)
-        )  # [pos, vel, orientation (eulr), bias_accel, bias_ang_vel] (errors)
-
-        self.error_state_covariance = p * np.eye(self.N_err_state)
-
-        # Inverse time constants for the bias processes
-        self.p_bias_accel = p_ba
-        self.p_bias_ang_vel = p_bv
-
-        # Noise terms
-        self.process_noise_covariance = n * np.eye(self.N_noise_terms)
-        self.measurement_noise_covariance = r * np.eye(self.N_meas_terms)
-
-        # Avoid dt in propagate growing too high
-        self.is_init = False
-        self.last_time = time.time()
-
-    def n(self):
-        # Sample 12-dim zero mean process noise vector
-        return np.random.multivariate_normal(
-            np.zeros(self.N_noise_terms), self.process_noise_covariance
-        ).reshape((self.N_noise_terms, 1))
-
-    def w(self):
-        # Sample 3-dim zero mean measurement noise vector
-        return np.random.multivariate_normal(
-            np.zeros(self.N_meas_terms), self.measurement_noise_covariance
-        ).reshape((self.N_meas_terms, 1))
-
-    def Hx(self):
-        """
-        Measurement model. This is a very simple model since the DVL gets us velocity measurements in body, in relation to world.
-        """
-        H = np.zeros((3, self.N_nom_state))
-        H[:3, 3:6] = np.eye(3)
-        return H
-
-    def predict_measurement(self):
-        z_pred = self.Hx() @ self.nom_state + self.w()
-        return z_pred
-
-    def compose_state(self):
-        x = np.zeros_like(self.nom_state)
-
-        # "Normal addition"
-        x[:3] = self.nom_state[:3] + self.err_state[:3]
-        x[3:6] = self.nom_state[3:6] + self.err_state[3:6]
-        x[10:13] = self.nom_state[10:13] + self.err_state[9:12]
-        x[13:16] = self.nom_state[13:16] + self.err_state[12:15]
-
-        # Quaternion multiplication
-        qa = self.nom_state[6:10]
-        eta_a = qa[:1].ravel()
-        eps_a = qa[1:].ravel()
-
-        qb = np.r_[np.array([1]).reshape(1, 1), 0.5 * self.err_state[6:9, :]]
-        QA = np.zeros((4, 4))
-        QA[:3, 0] = eps_a
-        QA[0, 1:4] = -eps_a.T
-        QA[1:4, 1:4] = self.S(eps_a)
-
-        x[6:10] = (eta_a * np.eye(4) + QA) @ qb
-
-        return x
-
-    def update(self, measured_accel, measured_ang_vel):
-
-        if not self.is_init:
-            self.last_time = time.time()
-            self.is_init = True
-
-        T = time.time() - self.last_time
-
-        A, G = self.discretize(measured_accel, measured_ang_vel, T)
-
-        err_state_dot = A @ self.err_state + G @ self.n()
-
-        self.err_state += T * err_state_dot  # simple euler integration
-        self.last_time = time.time()
-
-        rospy.loginfo(self.err_state)
-
-    def correct(self, measured_vel):
-        # EKF update
-        H = self.measurement_jacobian()
-        P = self.error_state_covariance
-
-        W = P @ H.T @ la.inv(H @ P @ H.T + self.measurement_noise_covariance)
-        self.err_state = W @ (measured_vel - self.predict_measurement())
-        P = (np.eye(self.N_err_state) - W @ H) @ P
-        self.nom_state = self.compose_state()
-
-        # Reset covariance
-        G = np.eye(self.N_err_state)
-        G[6:9, 6:9] = np.eye(3) - self.S(0.5 * self.err_state[6:9])
-        self.error_state_covariance = G @ P @ G.T
-
-        # Reset error state
-        self.err_state = np.zeros((self.N_err_state, 1))
-
-    def measurement_jacobian(self):
-        # "H" in the literature
-
-        q = self.nom_state[6:10].T[0]
-        eta = q[:1]
-        eps = q[1:]
-
-        Q_dtheta = 0.5 * np.r_[-eps.reshape((1, 3)), eta * np.eye(3) + self.S(eps)]
-        X_dx = la.block_diag(np.eye(6), Q_dtheta, np.eye(6))
-
-        H = self.Hx() @ X_dx
-
-        return H.astype(np.float64)
-
-    def R(self, q):
-        eta = q[:1]
-        eps = q[1:]
-        S = self.S(eps)
-        R = np.eye(3) + 2 * eta * S + 2 * S @ S
-        return R
-
-    def S(self, v):
-        S = np.array(
-            [0, -v[2], v[1], v[2], 0, -v[0], -v[1], v[0], 0], dtype=object
-        ).reshape((3, 3))
-
-        return S
-
-    def A_ERR_CONT(self, measured_accel, measured_ang_vel):
-
-        q = self.nom_state[6:10]
-        bias_accel = self.nom_state[10:13]
-        bias_ang_vel = self.nom_state[13:16]
-
-        A = np.zeros((self.N_err_state, self.N_err_state))
-
-        A[:3, 3:6] = np.eye(3)
-        A[3:6, 6:9] = -self.R(q) @ self.S(measured_accel.reshape((3, 1)) - bias_accel)
-        A[3:6, 9:12] = -self.R(q)
-        A[6:9, 6:9] = -self.S(measured_ang_vel.reshape((3, 1)) - bias_ang_vel)
-        A[6:9, 12:15] = -np.eye(3)
-        A[9:12, 9:12] = -self.p_bias_accel * np.eye(3)
-        A[12:15, 12:15] = -self.p_bias_ang_vel * np.eye(3)
+        A = np.zeros((15, 15))
+        A[block_3x3(0, 1)] = np.eye(3)
+        A[block_3x3(1, 2)] = -x_nom_prev.ori.R @ get_cross_matrix(u_imu_body.acc - x_nom_prev.accm_bias)
+        A[block_3x3(1, 3)] = -x_nom_prev.ori.R
+        A[block_3x3(2, 2)] = -get_cross_matrix(u_imu_body.avel - x_nom_prev.acc_bias)
+        A[block_3x3(2, 4)] = -np.eye(3)
+        A[block_3x3(3, 3)] = -self.acc_bias_p*self.acc_correction
+        A[block_3x3(4, 4)] = -self.gyro_bias_p*self.gyro_correction
 
         return A
 
-    def G_ERR_CONT(self):
-        q = self.nom_state[6:10]
+    def GQGT_err_cont(self,
+        x_nom_prev: NominalState
+        ) -> 'ndarray[15, 12]':
+        """The noise covariance matrix, GQGT, in (10.68)
 
-        G = np.zeros((self.N_err_state, self.N_noise_terms))
+        From (Theorem 3.2.2) we can see that (10.68) can be written as 
+        d/dt x_err = A@x_err + G@n == A@x_err + m
+        where m is gaussian with mean 0 and covariance G @ Q @ G.T. Thats why
+        we need GQGT.
 
-        G[3:6, :3] = -self.R(q)
-        G[6:9, 3:6] = -np.eye(3)
-        G[9:12, 6:9] = np.eye(3)
-        G[12:15, 9:12] = np.eye(3)
+        Hint: you can use block_3x3 to simplify indexing if you want to.
+        The first I element in G can be set as G[block_3x3(2, 1)] = -np.eye(3)
 
-        return G
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+        Returns:
+            GQGT (ndarray[15, 15]): G @ Q @ G.T
+        """
+        G = np.zeros((15, 12))
 
-    def discretize(self, measured_accel, measured_ang_vel, T):
-        AC = self.A_ERR_CONT(measured_accel, measured_ang_vel)
-        GC = self.G_ERR_CONT()
+        G[block_3x3(1, 0)] = -x_nom_prev.ori.R
+        G[block_3x3(2, 1)] = -np.eye(3)
+        G[block_3x3(3, 2)] = np.eye(3)
+        G[block_3x3(4, 3)] = np.eye(3)
 
-        AD = la.expm(T * AC)
-        GD = T * GC
-        return AD, GD
+        GQGT = G@self.Q_err@G.T
+
+        return GQGT
+
+    def get_van_loan_matrix(self, V: 'ndarray[30, 30]'):
+        """Use this funciton in get_discrete_error_diff to get the van loan 
+        matrix. See (4.63)
+
+        All the tests are ran with do_approximations=False
+
+        Args:
+            V (ndarray[30, 30]): [description]
+
+        Returns:
+            VLM (ndarray[30, 30]): VanLoanMatrix
+        """
+        # second order approcimation of matrix exponential which is faster
+        #VLM = np.eye(*V.shape) + V + (V@V) / 2
+
+        VLM = scipy.linalg.expm(V)
+        return VLM
+
+    def discretize(self,
+                                x_nom_prev: NominalState,
+                                u_imu_body: ImuMeasurement,
+                                ) -> Tuple['ndarray[15, 15]',
+                                           'ndarray[15, 15]']:
+        """Get the discrete equivalents of A and GQGT in (4.63)
+
+        Hint: you should use get_van_loan_matrix to get the van loan matrix
+
+        See (4.5 Discretization) and (4.63) for more information. 
+        Or see "Discretization of process noise" in 
+        https://en.wikipedia.org/wiki/Discretization
+
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+            z_corr (ImuMeasurement): corrected IMU measurement
+
+        Returns:
+            Ad (ndarray[15, 15]): discrede transition matrix
+            GQGTd (ndarray[15, 15]): discrete noise covariance matrix
+        """
+        Ts = abs(x_nom_prev.ts - u_imu_body.ts)
+
+        A = self.A_err_cont(x_nom_prev, u_imu_body)
+        GQGT = self.GQGT_err_cont(x_nom_prev)
+
+        V = np.block([[-A, GQGT],
+                      [np.zeros((15, 15)), A.T]])
+
+        VL = self.get_van_loan_matrix(V*Ts)
+
+        V2 = VL[:15, 15:]
+        V1 = VL[15:, 15:]
+
+        Ad = V1.T
+        GQGTd = V1.T@V2
+
+        return Ad, GQGTd
+
+    def imu_to_body(self,
+                      x_nom_prev: NominalState,
+                      u_imu: ImuMeasurement,
+                      ) -> ImuMeasurement:
+        """Correct IMU measurement so it gives a measurement of acceleration 
+        and angular velocity in body.
+
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+            z_imu (ImuMeasurement): raw IMU measurement
+
+        Returns:
+            ImuMeasurement: corrected IMU measurement
+        """
+        acc_imu = u_imu.acc - x_nom_prev.accm_bias
+        avel_imu = u_imu.avel - x_nom_prev.gyro_bias
+        
+        acc_body = self.acc_correction@acc_imu
+        avel_body = self.gyro_correction@avel_imu
+
+        z_corr = ImuMeasurement(u_imu.ts, acc_body, avel_body)
+
+        return z_corr
+       
+
+    def predict_x_nom(self,
+                        x_nom_prev: NominalState,
+                        z_corr: ImuMeasurement,
+                        ) -> NominalState:
+        """Predict the nominal state, given a corrected IMU measurement
+
+        Hint: Discrete time prediction of equation (10.58)
+        See the assignment description for more hints 
+
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+            z_corr (ImuMeasurement): corrected IMU measuremnt
+
+        Returns:
+            x_nom_pred (NominalState): predicted nominal state
+        """
+
+        if x_nom_prev.ts is None:
+            x_nom_prev.ts = 0
+
+        # Catch NaN's
+        if x_nom_prev.ori.real_part is np.nan or any(x_nom_prev.ori.vec_part) is np.nan:
+            x_nom_prev.ori = RotationQuaterion(1, np.zeros((3, 1)))
+
+        h = float(abs(x_nom_prev.ts - z_corr.ts))
+
+        # Previous state
+        pos_prev = x_nom_prev.pos
+        vel_prev = x_nom_prev.vel
+        ori_prev = x_nom_prev.ori
+        acc_bias_prev = x_nom_prev.accm_bias
+        gyro_bias_prev = x_nom_prev.gyro_bias
+
+        # Measurements
+        z_acc = z_corr.acc
+        z_avel = z_corr.avel
+
+        # State derivatives from Brekke (10.58)
+        pos_dot = vel_prev
+        vel_dot = x_nom_prev.ori.R@(z_acc - acc_bias_prev) + self.g
+        acc_bias_dot = -self.acc_bias_rate   * np.eye(3) @ acc_bias_prev
+        gyro_bias_dot = -self.gyro_bias_std * np.eye(3) @ gyro_bias_prev
+
+        # Euler step to get predictions from 
+        pos = pos_prev + h*pos_dot
+        vel = vel_prev + h*vel_dot
+        acc_bias = acc_bias_prev + h*acc_bias_dot
+        gyro_bias = gyro_bias_prev + h*gyro_bias_dot
+
+        # Orientation
+        omega = np.array(z_avel - gyro_bias_prev)
+        nu = ori_prev.real_part
+        eta = np.array(ori_prev.vec_part)
+        q_dot_real = -0.5*omega@eta.T
+        q_dot_vec = (nu*np.eye(3) + get_cross_matrix(eta))@omega.T
+
+        q_pred_real = nu + h*q_dot_real
+        q_pred_vec = eta + h*q_dot_vec
+
+        norm = np.sqrt(q_pred_real**2 + sum(e*e for e in q_pred_vec))
+
+        q = RotationQuaterion(q_pred_real/norm, q_pred_vec/norm)
+
+        x_nom_pred = NominalState(pos, vel, q, acc_bias, gyro_bias)
+
+        return x_nom_pred
+
+    def predict_x_err(self,
+                      x_nom_prev: NominalState,
+                      x_err_prev_gauss: ErrorStateGauss,
+                      z_corr: ImuMeasurement,
+                      ) -> ErrorStateGauss:
+        """Predict the error state by doing a discrete step of Brekke (10.68)
+
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+            x_err_prev_gauss (ErrorStateGauss): previous error state gaussian
+            z_corr (ImuMeasurement): corrected IMU measuremnt
+
+        Returns:
+            x_err_pred (ErrorStateGauss): predicted error state
+        """
+        Ad, GQGTd = self.discretize(x_nom_prev, z_corr)
+
+        P_prev = x_err_prev_gauss.cov
+        Q = Ad@P_prev@Ad.T + GQGTd
+
+        x_err_pred = ErrorStateGauss(x_err_prev_gauss.mean, Q, x_nom_prev.ts)
+
+        return x_err_pred
 
 
-if __name__ == "__main__":
+    def predict(self,
+        x_nom_prev: NominalState,
+        x_err: ErrorStateGauss,
+        u_imu: ImuMeasurement,
+        ) -> Tuple[NominalState, ErrorStateGauss]:
+        """Run a prediction step for every IMU input
 
-    try:
-        eskf = ESKF_ROS()
-        rospy.spin()
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+            x_err_gauss (ErrorStateGauss): previous error state gaussian
+            z_imu (ImuMeasurement): raw IMU measurement
 
-    except rospy.ROSInterruptException:
-        pass
+        Returns:
+            x_nom_pred (NominalState): predicted nominal state
+            x_err_pred (ErrorStateGauss): predicted error state
+        """
+
+        u_imu_body = self.imu_to_body(x_nom_prev, u_imu)
+        
+        x_nom_pred = self.predict_nominal(x_nom_prev, u_imu_body)
+        x_err_pred = self.predict_x_err(x_nom_prev, x_err, u_imu_body)
+
+        return x_nom_pred, x_err_pred
+
+    def inject(self,
+               x_nom_prev: NominalState,
+               x_err_upd: ErrorStateGauss
+               ) -> Tuple[NominalState, ErrorStateGauss]:
+        """Perform the injection step, an implementation of Brekke
+        (10.72), (10.85) and (10.86)
+
+        Args:
+            x_nom_prev (NominalState): previous nominal state
+            x_err_upd (ErrorStateGauss): updated error state gaussian
+
+        Returns:
+            x_nom_inj (NominalState): nominal state after injection
+            x_err_inj (ErrorStateGauss): error state gaussian after injection
+        """
+        x_nom_inj = NominalState(
+            x_nom_prev.pos + x_err_upd.pos,
+            x_nom_prev.vel + x_err_upd.vel,
+            x_nom_prev.ori.multiply(RotationQuaterion(1, 0.5*x_err_upd.avec)), 
+            x_nom_prev.accm_bias + x_err_upd.accm_bias,
+            x_nom_prev.gyro_bias + x_err_upd.gyro_bias,
+            x_nom_prev.ts      
+        )
+
+        mean = np.zeros(15)
+        G = np.eye(15)
+        G[6:9, 6:9] = np.eye(3) - get_cross_matrix(0.5*x_err_upd.avec)
+        cov = G@x_err_upd.cov@G.T
+
+        x_err_inj = ErrorStateGauss(mean, cov, x_err_upd.ts)
+        return x_nom_inj, x_err_inj
+
