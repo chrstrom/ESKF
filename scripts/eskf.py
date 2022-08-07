@@ -199,8 +199,14 @@ class ESKF():
         """
         Ts = abs(x_nom_prev.ts - u_imu_body.ts)
 
+<<<<<<< HEAD
         A = self.A_err_cont(x_nom_prev, u_imu_body)
         GQGT = self.GQGT_err_cont(x_nom_prev)
+=======
+    def predict_measurement(self):
+        z_pred = self.Hx() @ self.nom_state
+        return z_pred
+>>>>>>> 614749c4cdf10691431ea27610c874ee61db8e46
 
         V = np.block([[-A, GQGT],
                       [np.zeros((15, 15)), A.T]])
@@ -240,11 +246,15 @@ class ESKF():
         return z_corr
        
 
+<<<<<<< HEAD
     def predict_x_nom(self,
                         x_nom_prev: NominalState,
                         z_corr: ImuMeasurement,
                         ) -> NominalState:
         """Predict the nominal state, given a corrected IMU measurement
+=======
+        err_state_dot = A @ self.err_state
+>>>>>>> 614749c4cdf10691431ea27610c874ee61db8e46
 
         Hint: Discrete time prediction of equation (10.58)
         See the assignment description for more hints 
