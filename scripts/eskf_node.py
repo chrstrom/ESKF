@@ -10,6 +10,8 @@ from sensors.pressure import PressureSensor
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import ImuSensor
 from geometry_msgs.msg import TwistStamped
+
+
 class ESKF_NODE:
     """Workflow:
     run imu.predict for every incoming IMU measurement
@@ -27,15 +29,15 @@ class ESKF_NODE:
         pressure = PressureSensor()
         eskf = ESKF()
 
-
         self.odom_pub = rospy.Publisher("/odometry/ned", Odometry, queue_size=10)
 
         rospy.Subscriber("/imu/data_raw", ImuSensor, self.imu_cb, queue_size=10)
-        rospy.Subscriber("/dvl/dvl_data", TwistStamped, self.dvl_callback, queue_size=10)
+        rospy.Subscriber(
+            "/dvl/dvl_data", TwistStamped, self.dvl_callback, queue_size=10
+        )
         # TODO: Pressure sensor callback
 
         self.rate = rospy.Rate(frequency)
-
 
     def imu_cb(self, msg):
         # Map to body
@@ -51,7 +53,6 @@ class ESKF_NODE:
         # Reset error state
         pass
 
-
     def spin(self):
 
         while not rospy.is_shutdown():
@@ -62,8 +63,7 @@ class ESKF_NODE:
             self.rate.sleep()
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     rospy.init_node("eskf")
     eskf = ESKF_NODE(30)
     eskf.spin()
