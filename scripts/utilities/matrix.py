@@ -1,9 +1,6 @@
 import numpy as np
 from numpy import ndarray
 
-from functools import cache
-
-
 def skew(vec: ndarray) -> ndarray:
     """Get the skew matrix from a vector
     Args:
@@ -15,8 +12,6 @@ def skew(vec: ndarray) -> ndarray:
 
     return S
 
-
-@cache
 def block_3x3(i: int, j: int):
     """Generate 3x3 slices, useful for setting blocks in larger matrices
     ...
