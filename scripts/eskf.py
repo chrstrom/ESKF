@@ -2,69 +2,13 @@ import numpy as np
 from numpy import ndarray
 import scipy
 from dataclasses import dataclass, field
-from typing import Tuple, Optional
+from typing import Tuple
 
-from types.multivariate_gaussian import MultiVariateGaussian
-from types.measurements import ImuMeasurement
-from types.quaternion import Quaternion
+from sensors.imu import ImuData
 
+from eskf_types.state import NominalState, ErrorStateGauss
+from eskf_types.quaternion import Quaternion
 from utilities.matrix import skew, block_3x3
-
-
-@dataclass
-class NominalState:
-    """Class representing a nominal state as in Brekke (Table 10.1)
-    Args:
-        pos (ndarray[3]): position in NED
-        vel (ndarray[3]): velocity in NED
-        ori (Quaternion): orientation as a quaternion in NED
-        accm_bias (ndarray[3]): accelerometer bias
-        gyro_bias (ndarray[3]): gyro bias
-    """
-
-    pos: "ndarray[3]"
-    vel: "ndarray[3]"
-    ori: "Quaternion"
-    accm_bias: "ndarray[3]"
-    gyro_bias: "ndarray[3]"
-
-    ts: Optional[float] = None
-
-
-@dataclass
-class ErrorStateGauss(MultiVariateGaussian):
-    """A multivariate gaussian representing the error state."""
-
-    def __post_init__(self):
-        super().__post_init__()
-
-    @property
-    def pos(self):
-        """position"""
-        return self.mean[0:3]
-
-    @property
-    def vel(self):
-        """velocity"""
-        return self.mean[3:6]
-
-    @property
-    def avec(self):
-        """angles vector
-        this is often called a rotation vector
-        """
-        return self.mean[6:9]
-
-    @property
-    def accm_bias(self):
-        """accelerometer bias"""
-        return self.mean[9:12]
-
-    @property
-    def gyro_bias(self):
-        """gyro bias"""
-        return self.mean[12:15]
-
 
 @dataclass
 class ESKF:
@@ -95,7 +39,7 @@ class ESKF:
     def A_err_cont(
         self,
         x_nom_prev: NominalState,
-        u_imu_body: ImuMeasurement,
+        u_imu_body: ImuData,
     ) -> "ndarray[15,15]":
         """Get the transition matrix, A, in Brekke (10.68)
 
@@ -108,7 +52,7 @@ class ESKF:
         A = np.zeros((15, 15))
         A[block_3x3(0, 1)] = np.eye(3)
         A[block_3x3(1, 2)] = -x_nom_prev.ori.R @ skew(
-            u_imu_body.acc - x_nom_prev.accm_bias
+            u_imu_body.acc - x_nom_prev.acc_bias
         )
         A[block_3x3(1, 3)] = -x_nom_prev.ori.R
         A[block_3x3(2, 2)] = -skew(u_imu_body.avel - x_nom_prev.acc_bias)
@@ -166,7 +110,7 @@ class ESKF:
     def discretize(
         self,
         x_nom_prev: NominalState,
-        u_imu_body: ImuMeasurement,
+        u_imu_body: ImuData,
     ) -> Tuple["ndarray[15, 15]", "ndarray[15, 15]"]:
         """Get the discrete equivalents of A and GQGT in (4.63)
 
@@ -204,8 +148,8 @@ class ESKF:
     def imu_to_body(
         self,
         x_nom_prev: NominalState,
-        u_imu: ImuMeasurement,
-    ) -> ImuMeasurement:
+        u_imu: ImuData,
+    ) -> ImuData:
         """Correct IMU measurement so it gives a measurement of acceleration
         and angular velocity in body.
 
@@ -216,20 +160,21 @@ class ESKF:
         Returns:
             ImuMeasurement: corrected IMU measurement
         """
-        acc_imu = u_imu.acc - x_nom_prev.accm_bias
+
+        acc_imu = u_imu.acc - x_nom_prev.acc_bias
         avel_imu = u_imu.avel - x_nom_prev.gyro_bias
 
         acc_body = self.acc_correction @ acc_imu
         avel_body = self.gyro_correction @ avel_imu
 
-        z_corr = ImuMeasurement(u_imu.ts, acc_body, avel_body)
+        imu_body = ImuData(u_imu.ts, acc_body, avel_body)
 
-        return z_corr
+        return imu_body
 
     def predict_x_nom(
         self,
         x_nom_prev: NominalState,
-        z_corr: ImuMeasurement,
+        z_corr: ImuData,
     ) -> NominalState:
         """Predict the nominal state, given a corrected IMU measurement
 
@@ -257,7 +202,7 @@ class ESKF:
         pos_prev = x_nom_prev.pos
         vel_prev = x_nom_prev.vel
         ori_prev = x_nom_prev.ori
-        acc_bias_prev = x_nom_prev.accm_bias
+        acc_bias_prev = x_nom_prev.acc_bias
         gyro_bias_prev = x_nom_prev.gyro_bias
 
         # Measurements
@@ -298,7 +243,7 @@ class ESKF:
         self,
         x_nom_prev: NominalState,
         x_err_prev_gauss: ErrorStateGauss,
-        z_corr: ImuMeasurement,
+        z_corr: ImuData,
     ) -> ErrorStateGauss:
         """Predict the error state by doing a discrete step of Brekke (10.68)
 
@@ -323,7 +268,7 @@ class ESKF:
         self,
         x_nom_prev: NominalState,
         x_err: ErrorStateGauss,
-        u_imu: ImuMeasurement,
+        u_imu: ImuData,
     ) -> Tuple[NominalState, ErrorStateGauss]:
         """Run a prediction step for every IMU input
 
@@ -362,7 +307,7 @@ class ESKF:
             x_nom_prev.pos + x_err_upd.pos,
             x_nom_prev.vel + x_err_upd.vel,
             x_nom_prev.ori.multiply(Quaternion(1, 0.5 * x_err_upd.avec)),
-            x_nom_prev.accm_bias + x_err_upd.accm_bias,
+            x_nom_prev.acc_bias + x_err_upd.acc_bias,
             x_nom_prev.gyro_bias + x_err_upd.gyro_bias,
             x_nom_prev.ts,
         )

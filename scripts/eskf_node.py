@@ -1,15 +1,19 @@
 #!/usr/bin/python3
 
-import queue
 import rospy
+import numpy as np
 
 from eskf import ESKF
+
+from sensors.imu import ImuData
 from sensors.dvl import DVL
-from sensors.pressure import PressureSensor
+from sensors.depth import DepthSensor
+from eskf_types.state import NominalState
+from eskf_types.quaternion import Quaternion
 
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import ImuSensor
-from geometry_msgs.msg import TwistStamped
+from sensor_msgs.msg import Imu
+from geometry_msgs.msg import TwistWithCovarianceStamped, PoseWithCovarianceStamped
 
 
 class ESKF_NODE:
@@ -26,32 +30,56 @@ class ESKF_NODE:
 
     def __init__(self, frequency) -> None:
         dvl = DVL()
-        pressure = PressureSensor()
-        eskf = ESKF()
+        depth = DepthSensor()
+        acc_std = acc_bias_std = acc_bias_rate = gyro_std = gyro_bias_std =  gyro_bias_rate = 0
+        acc_correction = np.eye(3)
+        gyro_correction = np.eye(3)
+        lever_arm = np.array((0, 0, 0))
+
+        self.eskf = ESKF(acc_std, acc_bias_std, acc_bias_rate,
+            gyro_std, gyro_bias_std, gyro_bias_rate,
+            acc_correction, gyro_correction, lever_arm
+        )
+
+        pos = vel = acc_bias = gyro_bias = np.array((0, 0, 0))
+        ori = Quaternion(0, np.array((0, 0, 1)))
+        self.x_nom_prev = NominalState(pos, vel, ori, acc_bias, gyro_bias, rospy.Time.now().to_sec())
 
         self.odom_pub = rospy.Publisher("/odometry/ned", Odometry, queue_size=10)
 
-        rospy.Subscriber("/imu/data_raw", ImuSensor, self.imu_cb, queue_size=10)
-        rospy.Subscriber(
-            "/dvl/dvl_data", TwistStamped, self.dvl_callback, queue_size=10
-        )
-        # TODO: Pressure sensor callback
+        rospy.Subscriber("/imu/data_raw", Imu, self.imu_cb, queue_size=10)
+        rospy.Subscriber("/dvl/dvl_data", TwistWithCovarianceStamped, self.dvl_cb, queue_size=10)
+        rospy.Subscriber("/dvl/ahrs_pose", PoseWithCovarianceStamped, self.depth_cb, queue_size=10)
 
         self.rate = rospy.Rate(frequency)
 
     def imu_cb(self, msg):
-        # Map to body
+        ts = msg.header.stamp.to_sec()
+        av = msg.angular_velocity
+        la = msg.linear_acceleration
+        avel = np.array((av.x, av.y, av.z))
+        acc = np.array((la.x, la.y, la.z))
+
+        u_imu = ImuData(ts, acc, avel)
+        imu_body = self.eskf.imu_to_body(self.x_nom_prev, u_imu)
+        x_nom_pred = self.eskf.predict_x_nom(self.x_nom_prev, imu_body)
+        
         # predict imu measurement
         # propagate error state
-        pass
 
-    def dvl_callback(self, msg):
+    def dvl_cb(self, msg):
+        ts = msg.header.stamp.to_sec()
+        vel = msg.twist.twist.linear
         # Map to body
         # Predict dvl measurement
         # Correct covariances
         # Inject error state
         # Reset error state
         pass
+
+    def depth_cb(self, msg):
+        ts = msg.header.stamp.to_sec()
+        depth = -msg.pose.pose.position.z # NED
 
     def spin(self):
 
