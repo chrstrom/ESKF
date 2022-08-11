@@ -29,8 +29,8 @@ class NominalState:
 class ErrorStateGauss(MultiVariateGaussian):
     """A multivariate gaussian representing the error state."""
 
-    def __post_init__(self):
-        super().__post_init__()
+    # def __post_init__(self):
+    #     super().__post_init__()
 
     @property
     def pos(self):

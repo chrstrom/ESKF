@@ -57,8 +57,8 @@ class ESKF:
         A[block_3x3(1, 3)] = -x_nom_prev.ori.R
         A[block_3x3(2, 2)] = -skew(u_imu_body.avel - x_nom_prev.acc_bias)
         A[block_3x3(2, 4)] = -np.eye(3)
-        A[block_3x3(3, 3)] = -self.acc_bias_p * self.acc_correction
-        A[block_3x3(4, 4)] = -self.gyro_bias_p * self.gyro_correction
+        A[block_3x3(3, 3)] = -self.acc_bias_rate * self.acc_correction
+        A[block_3x3(4, 4)] = -self.gyro_bias_rate * self.gyro_correction
 
         return A
 
@@ -128,9 +128,10 @@ class ESKF:
             Ad (ndarray[15, 15]): discrede transition matrix
             GQGTd (ndarray[15, 15]): discrete noise covariance matrix
         """
-        Ts = abs(x_nom_prev.ts - u_imu_body.ts)
+        Ts = 0.004 #abs(x_nom_prev.ts - u_imu_body.ts) # TODO: How to handle difference in ROSTIME and now?
 
         A = self.A_err_cont(x_nom_prev, u_imu_body)
+
         GQGT = self.GQGT_err_cont(x_nom_prev)
 
         V = np.block([[-A, GQGT], [np.zeros((15, 15)), A.T]])
@@ -174,7 +175,7 @@ class ESKF:
     def predict_x_nom(
         self,
         x_nom_prev: NominalState,
-        z_corr: ImuData,
+        u_imu: ImuData,
     ) -> NominalState:
         """Predict the nominal state, given a corrected IMU measurement
 
@@ -196,7 +197,7 @@ class ESKF:
         if x_nom_prev.ori.real_part is np.nan or any(x_nom_prev.ori.vec_part) is np.nan:
             x_nom_prev.ori = Quaternion(1, np.zeros((3, 1)))
 
-        h = float(abs(x_nom_prev.ts - z_corr.ts))
+        h = 0.004 #float(abs(x_nom_prev.ts - u_imu.ts)) # TODO: Fix time stepping
 
         # Previous state
         pos_prev = x_nom_prev.pos
@@ -206,8 +207,8 @@ class ESKF:
         gyro_bias_prev = x_nom_prev.gyro_bias
 
         # Measurements
-        z_acc = z_corr.acc
-        z_avel = z_corr.avel
+        z_acc = u_imu.acc
+        z_avel = u_imu.avel
 
         # State derivatives from Brekke (10.58)
         pos_dot = vel_prev
@@ -243,7 +244,7 @@ class ESKF:
         self,
         x_nom_prev: NominalState,
         x_err_prev_gauss: ErrorStateGauss,
-        z_corr: ImuData,
+        u_imu: ImuData,
     ) -> ErrorStateGauss:
         """Predict the error state by doing a discrete step of Brekke (10.68)
 
@@ -255,7 +256,7 @@ class ESKF:
         Returns:
             x_err_pred (ErrorStateGauss): predicted error state
         """
-        Ad, GQGTd = self.discretize(x_nom_prev, z_corr)
+        Ad, GQGTd = self.discretize(x_nom_prev, u_imu)
 
         P_prev = x_err_prev_gauss.cov
         Q = Ad @ P_prev @ Ad.T + GQGTd
@@ -284,7 +285,7 @@ class ESKF:
 
         u_imu_body = self.imu_to_body(x_nom_prev, u_imu)
 
-        x_nom_pred = self.predict_nominal(x_nom_prev, u_imu_body)
+        x_nom_pred = self.predict_x_nom(x_nom_prev, u_imu_body)
         x_err_pred = self.predict_x_err(x_nom_prev, x_err, u_imu_body)
 
         return x_nom_pred, x_err_pred
