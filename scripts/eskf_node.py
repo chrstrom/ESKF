@@ -2,15 +2,14 @@
 
 import rospy
 import numpy as np
+from datetime import datetime as dt
 
 from eskf import ESKF
 from utilities.matrix import block_3x3
 
 from sensors.imu import ImuData
 from sensors.dvl import DVL, DvlData
-from sensors.depth import DepthSensor
-from eskf_types.state import ErrorStateGauss, NominalState
-from eskf_types.quaternion import Quaternion
+from sensors.depth import DepthData, DepthSensor
 
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
@@ -33,13 +32,13 @@ class ESKF_NODE:
         self.dvl = DVL()
         self.depth = DepthSensor()
 
-        acc_std = 0.001
-        acc_bias_std = 0.0005
-        acc_bias_rate = 10e-12
+        acc_std = np.sqrt(0.05 / (1000*9.81))
+        acc_bias_std = np.sqrt(0.04 / (1000*9.81)) # Bias instability
+        acc_bias_rate = (0.07 / (3600)) # Rate random walk
 
-        gyro_std = 0.0002
-        gyro_bias_std = 0.00002
-        gyro_bias_rate = 10e-12
+        gyro_std = np.sqrt((0.3 / (3600)) * np.pi / 180)
+        gyro_bias_std = np.sqrt((0.3 / (3600)) * np.pi / 180)
+        gyro_bias_rate = (0.15 / (3600)) * np.pi / 180
 
         acc_correction = np.eye(3)
         gyro_correction = np.eye(3)
@@ -50,24 +49,16 @@ class ESKF_NODE:
             acc_correction, gyro_correction, lever_arm
         )
 
-        pos = vel = acc_bias = gyro_bias = np.zeros(3)
-        ori = Quaternion(1, np.array((0, 0, 0)))
-        self.x_nom_prev = NominalState(pos, vel, ori, acc_bias, gyro_bias, rospy.Time.now().to_sec())
-
         self.odom_pub = rospy.Publisher("/odometry/ned", Odometry, queue_size=10)
 
         rospy.Subscriber("/imu/data_raw", Imu, self.imu_cb, queue_size=10)
         rospy.Subscriber("/dvl/dvl_data", TwistWithCovarianceStamped, self.dvl_cb, queue_size=10)
-        rospy.Subscriber("/dvl/ahrs_pose", PoseWithCovarianceStamped, self.depth_cb, queue_size=10)
+        rospy.Subscriber("/dvl/ahrs_pose", PoseWithCovarianceStamped, self.ahrs_cb, queue_size=10)
 
         self.rate = rospy.Rate(frequency)
 
-        # TODO: Parametrize
-        init_std = np.repeat(repeats=3, a=[0, 0, np.deg2rad(0), 0.001, 0.001]) 
-        self.x_err_prev = ErrorStateGauss(np.zeros(15), np.diag(init_std**2), rospy.Time.now().to_sec())
-
     def imu_cb(self, msg):
-        ts = msg.header.stamp.to_sec()
+        ts = dt.now().timestamp()
         av = msg.angular_velocity
         la = msg.linear_acceleration
 
@@ -75,15 +66,12 @@ class ESKF_NODE:
         avel = np.array((av.x, av.y, av.z))
 
         u_imu = ImuData(ts, acc, avel)
-        x_nom_pred, x_err_pred = self.eskf.predict(self.x_nom_prev, self.x_err_prev, u_imu)
 
-        self.x_nom_prev = x_nom_pred
-        self.x_err_prev = x_err_pred
-        self.x_nom_prev.ts = rospy.Time.now().to_sec()
+        self.eskf.predict(u_imu)
 
 
     def dvl_cb(self, msg):
-        ts = msg.header.stamp.to_sec()
+        ts = dt.now().timestamp()
         v = msg.twist.twist.linear
 
         vel = np.array((v.x, v.y, v.z))
@@ -92,18 +80,19 @@ class ESKF_NODE:
         
         z_dvl = DvlData(ts, vel, cov)
 
-        x_err_upd = self.dvl.update(self.x_nom_prev, self.x_err_prev, z_dvl)
-
-        x_nom_inj, x_err_inj = self.eskf.inject(self.x_nom_prev, x_err_upd)
-
-        self.x_nom_prev = x_nom_inj
-        self.x_err_prev = x_err_inj
-        self.x_nom_prev.ts = rospy.Time.now().to_sec()
+        x_err_upd = self.dvl.update(self.eskf.x_nom_prev, self.eskf.x_err_prev, z_dvl)
+        self.eskf.inject(x_err_upd)
 
 
-    def depth_cb(self, msg):
-        ts = msg.header.stamp.to_sec()
+    def ahrs_cb(self, msg):
+        ts = dt.now().timestamp()
         depth = -msg.pose.pose.position.z # NED
+        cov = msg.pose.covariance[14]
+
+        z_depth = DepthData(ts, depth, cov)
+
+        x_err_upd = self.depth.update(self.eskf.x_nom_prev, self.eskf.x_err_prev, z_depth)
+        self.eskf.inject(x_err_upd)
 
     def spin(self):
 
@@ -112,9 +101,9 @@ class ESKF_NODE:
         seq = 0
         while not rospy.is_shutdown():
 
-            eskf_pos = self.x_nom_prev.pos
-            eskf_ori = self.x_nom_prev.ori
-            eskf_vel = self.x_nom_prev.vel
+            eskf_pos = self.eskf.x_nom_prev.pos
+            eskf_ori = self.eskf.x_nom_prev.ori
+            eskf_vel = self.eskf.x_nom_prev.vel
 
 
             pos = Point()

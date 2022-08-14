@@ -1,8 +1,11 @@
 import numpy as np
 from numpy import ndarray
+import threading
 import scipy
 from dataclasses import dataclass, field
 from typing import Tuple
+
+from datetime import datetime as dt
 
 from sensors.imu import ImuData
 
@@ -35,6 +38,16 @@ class ESKF:
         O = self.gyro_bias_std**2 * np.eye(3)
 
         self.Q_err = scipy.linalg.block_diag(V, T, A, O)
+
+        # Initialize the variables holding the posteriors
+        pos = vel = acc_bias = gyro_bias = np.zeros(3)
+        ori = Quaternion(1, np.array((0, 0, 0)))
+        self.x_nom_prev = NominalState(pos, vel, ori, acc_bias, gyro_bias, 0)
+        init_std = np.repeat(repeats=3, a=[0, 0, np.deg2rad(0), 0.0001, 0.0001]) 
+        self.x_err_prev = ErrorStateGauss(np.zeros(15), np.diag(init_std**2), 0)
+
+        self.gauss_mutex = threading.Lock()
+        self.start_time = dt.now()
 
     def A_err_cont(
         self,
@@ -162,8 +175,8 @@ class ESKF:
             ImuMeasurement: corrected IMU measurement
         """
 
-        acc_imu = u_imu.acc - x_nom_prev.acc_bias
-        avel_imu = u_imu.avel - x_nom_prev.gyro_bias
+        acc_imu = u_imu.acc #- x_nom_prev.acc_bias
+        avel_imu = u_imu.avel #- x_nom_prev.gyro_bias
 
         acc_body = self.acc_correction @ acc_imu
         avel_body = self.gyro_correction @ avel_imu
@@ -267,8 +280,6 @@ class ESKF:
 
     def predict(
         self,
-        x_nom_prev: NominalState,
-        x_err: ErrorStateGauss,
         u_imu: ImuData,
     ) -> Tuple[NominalState, ErrorStateGauss]:
         """Run a prediction step for every IMU input
@@ -283,15 +294,18 @@ class ESKF:
             x_err_pred (ErrorStateGauss): predicted error state
         """
 
-        u_imu_body = self.imu_to_body(x_nom_prev, u_imu)
+        u_imu_body = self.imu_to_body(self.x_nom_prev, u_imu)
 
-        x_nom_pred = self.predict_x_nom(x_nom_prev, u_imu_body)
-        x_err_pred = self.predict_x_err(x_nom_prev, x_err, u_imu_body)
-
-        return x_nom_pred, x_err_pred
+        self.gauss_mutex.acquire()
+        self.x_nom_prev = self.predict_x_nom(self.x_nom_prev, u_imu_body)
+        self.x_nom_prev.ts = dt.now().timestamp()
+        self.x_err_prev = self.predict_x_err(self.x_nom_prev, self.x_err_prev, u_imu_body)
+        self.x_err_prev.ts = dt.now().timestamp()
+        self.gauss_mutex.release()
+        #return x_nom_pred, x_err_pred
 
     def inject(
-        self, x_nom_prev: NominalState, x_err_upd: ErrorStateGauss
+        self, x_err_upd: ErrorStateGauss
     ) -> Tuple[NominalState, ErrorStateGauss]:
         """Perform the injection step, an implementation of Brekke
         (10.72), (10.85) and (10.86)
@@ -304,19 +318,23 @@ class ESKF:
             x_nom_inj (NominalState): nominal state after injection
             x_err_inj (ErrorStateGauss): error state gaussian after injection
         """
-        x_nom_inj = NominalState(
-            x_nom_prev.pos + x_err_upd.pos,
-            x_nom_prev.vel + x_err_upd.vel,
-            x_nom_prev.ori.multiply(Quaternion(1, 0.5 * x_err_upd.avec)),
-            x_nom_prev.acc_bias + x_err_upd.acc_bias,
-            x_nom_prev.gyro_bias + x_err_upd.gyro_bias,
-            x_nom_prev.ts,
-        )
-
         mean = np.zeros(15)
         G = np.eye(15)
         G[6:9, 6:9] = np.eye(3) - skew(0.5 * x_err_upd.avec)
         cov = G @ x_err_upd.cov @ G.T
 
-        x_err_inj = ErrorStateGauss(mean, cov, x_err_upd.ts)
-        return x_nom_inj, x_err_inj
+        self.gauss_mutex.acquire()
+        self.x_nom_prev = NominalState(
+            self.x_nom_prev.pos + x_err_upd.pos,
+            self.x_nom_prev.vel + x_err_upd.vel,
+            self.x_nom_prev.ori.multiply(Quaternion(1, 0.5 * x_err_upd.avec)),
+            self.x_nom_prev.acc_bias + x_err_upd.acc_bias,
+            self.x_nom_prev.gyro_bias + x_err_upd.gyro_bias,
+            self.x_nom_prev.ts,
+        )
+        self.x_nom_prev.ts = dt.now().timestamp()
+        self.x_err_prev = ErrorStateGauss(mean, cov, x_err_upd.ts)
+        self.x_err_prev.ts = dt.now().timestamp()
+        self.gauss_mutex.release()
+
+        #return x_nom_inj, x_err_inj
